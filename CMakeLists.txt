@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.21)
-project(fusedmm_cuda CUDA)
+
+set(CMAKE_CUDA_COMPILER "/usr/local/cuda-11.6/bin/nvcc")
+
+project(FusedCuda CUDA)
+add_executable(FusedCuda sddmm_spmm_csr.cu)
+set(CMAKE_CUDA_STANDARD 20)
+
 find_package(CUDAToolkit)
 if(NOT CUDAToolkit_FOUND)
     message(FATAL_ERROR "Could not find CUDA toolkit")
@@ -9,16 +15,23 @@ if (NOT DEFINED $ENV{CUDA_HOME})
 endif ()
 
 set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
-set(CMAKE_CUDA_STANDARD 20)
+
+target_link_libraries( FusedCuda ${CUDA_cusparse_LIBRARY} )
+#message(FATAL_ERROR "Cuda Runtime exists at ${CUDA_cusparse_LIBRARY}")
+
+
+include_directories(${CUDA_TOOLKIT_INCLUDE_DIRECTORIES} common)
+target_compile_options(FusedCuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
+
 set(
-        CUDA_NVCC_FLAGS
-        ${CUDA_NVCC_FLAGS};
-        -lineinfo -gencode arch=compute_75,code=sm_75 --ptxas-options=-v --use_fast_math
+  CUDA_NVCC_FLAGS
+  ${CUDA_NVCC_FLAGS};
+  -lcublas_static -lcublasLt_static -lcusparse_static -lculibos -lineinfo -gencode arch=compute_75,code=sm_75 --ptxas-options=-v --use_fast_math
 )
 
-add_executable(fusedmm_cuda sddmm_spmm_csr.cu)
-target_compile_options(fusedmm_cuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
-include_directories(${CUDA_TOOLKIT_INCLUDE_DIRECTORIES} common)
+set_target_properties(
+  FusedCuda PROPERTIES
+  CUDA_SEPARABLE_COMPILATION ON
+)
 
-set_target_properties(fusedmm_cuda PROPERTIES
-        CUDA_SEPARABLE_COMPILATION ON)
+

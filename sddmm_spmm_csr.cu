@@ -1,17 +1,33 @@
 // System includes
 #include <iostream>
-// #include <cassert>
 
 // CUDA runtime
 #include <cuda_runtime.h>
 #include <cuda_profiler_api.h>
 
-// Helper functions and utilities to work with CUDA
-#include <helper_functions.h>
-#include <helper_cuda.h>
-
 // Sparse Operations, cusparseSpMM and cusparseSDDMM
 #include <cusparse.h>
+
+#define CHECK_CUDA(func)                                                       \
+{                                                                              \
+    cudaError_t status = (func);                                               \
+    if (status != cudaSuccess) {                                               \
+        printf("CUDA API failed at line %d with error: %s (%d)\n",             \
+               __LINE__, cudaGetErrorString(status), status);                  \
+        return EXIT_FAILURE;                                                   \
+    }                                                                          \
+}
+
+#define CHECK_CUSPARSE(func)                                                   \
+{                                                                              \
+    cusparseStatus_t status = (func);                                          \
+    if (status != CUSPARSE_STATUS_SUCCESS) {                                   \
+        printf("CUSPARSE API failed at line %d with error: %s (%d)\n",         \
+               __LINE__, cusparseGetErrorString(status), status);              \
+        return EXIT_FAILURE;                                                   \
+    }                                                                          \
+}
+
 
 using namespace std;
 
@@ -51,46 +67,49 @@ public:
     }
 };
 
-void ConstantInit(float *data, int size, float val) {
-    for (int i = 0; i < size; ++i) {
-        data[i] = val;
-    }
-}
-
 void calcPerf(float msecTotal, int nIter, int A_rows, int A_cols, int B_rows) {
     // Compute and print the performance
     float msecPerMatrixMul = msecTotal / nIter;
     double flopsPerMatrixMul = 2.0 * static_cast<double>(A_rows) *
                                static_cast<double>(A_cols) *
                                static_cast<double>(B_rows);
-    double gigaFlops =
-            (flopsPerMatrixMul * 1.0e-9f) / (msecPerMatrixMul / 1000.0f);
-    printf("Performance= %.2f GFlop/s, Time= %.3f msec, Size= %.0f Ops\n",
-           gigaFlops, msecPerMatrixMul, flopsPerMatrixMul);
+//    double gigaFlops =
+//            (flopsPerMatrixMul * 1.0e-9f) / (msecPerMatrixMul / 1000.0f);
+    double flops =
+            (flopsPerMatrixMul) / (msecPerMatrixMul / 1000.0f);
+    printf("Performance= %.2f Flop/s, Time= %.3f msec, Size= %.0f Ops\n",
+           flops, msecPerMatrixMul, flopsPerMatrixMul);
 }
 
-bool validate(int resultRows, int resultCols, float *h_C, int A_rows) {
-    float valB = 0.01f;
-    printf("Checking computed result for correctness: ");
-    bool correct = true;
-
-    // test relative error by the formula
-    //     |<x, y>_cpu - <x,y>_gpu|/<|x|, |y|>  < eps
-    double eps = 1.e-6; // machine zero
-
-    for (int i = 0; i < static_cast<int>(resultRows * resultCols); i++) {
-        double abs_err = fabs(h_C[i] - (A_rows * valB));
-        double dot_length = A_rows;
-        double abs_val = fabs(h_C[i]);
-        double rel_err = abs_err / abs_val / dot_length;
-
-        if (rel_err > eps) {
-            printf("Error! Matrix[%05d]=%.8f, ref=%.8f error term is > %E\n", i,
-                   h_C[i], A_rows * valB, eps);
-            correct = false;
+bool validate_sddmm(int C_nnz, float *hC_values, float *hC_result) {
+    int correct = 1;
+    for (int i = 0; i < C_nnz; i++) {
+        if (hC_values[i] != hC_result[i]) {
+            correct = 0; // direct floating point comparison is not reliable
+            break;
         }
     }
-    printf("%s\n", correct ? "Result = PASS" : "Result = FAIL");
+    if (correct)
+        printf("sddmm_csr_example test PASSED\n");
+    else
+        printf("sddmm_csr_example test FAILED: wrong result\n");
+    return correct;
+}
+
+bool validate_spmm(int A_num_rows, int B_num_cols, float *hC_values, float *hC_result) {
+    int correct = 1;
+    for (int i = 0; i < A_num_rows; i++) {
+        for (int j = 0; j < B_num_cols; j++) {
+            if (hC_values[i + j * A_num_rows] != hC_result[i + j * A_num_rows]) {
+                correct = 0; // direct floating point comparison is not reliable
+                break;
+            }
+        }
+    }
+    if (correct)
+        printf("spmm_csr_example test PASSED\n");
+    else
+        printf("spmm_csr_example test FAILED: wrong result\n");
     return correct;
 }
 
@@ -100,89 +119,89 @@ bool _sddmm(MatMul input, cudaStream_t stream) {
     // Device memory management
     int *dC_offsets, *dC_columns;
     float *dC_values, *dB, *dA;
-    checkCudaErrors(cudaMalloc((void **) &dA, input.A_size * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **) &dB, input.B_size * sizeof(float)));
-    checkCudaErrors(cudaMalloc((void **) &dC_offsets,
+    CHECK_CUDA(cudaMalloc((void **) &dA, input.A_size * sizeof(float)))
+    CHECK_CUDA(cudaMalloc((void **) &dB, input.B_size * sizeof(float)))
+    CHECK_CUDA(cudaMalloc((void **) &dC_offsets,
                                (input.A_num_rows + 1) * sizeof(int)));
-    checkCudaErrors(cudaMalloc((void **) &dC_columns, input.C_nnz * sizeof(int)));
-    checkCudaErrors(cudaMalloc((void **) &dC_values, input.C_nnz * sizeof(float)));
+    CHECK_CUDA(cudaMalloc((void **) &dC_columns, input.C_nnz * sizeof(int)))
+    CHECK_CUDA(cudaMalloc((void **) &dC_values, input.C_nnz * sizeof(float)))
 
-    checkCudaErrors(cudaMemcpy(dA, input.matA, input.A_size * sizeof(float),
-                               cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(dB, input.matB, input.B_size * sizeof(float),
-                               cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(dC_offsets, input.hC_offsets,
+    CHECK_CUDA(cudaMemcpy(dA, input.matA, input.A_size * sizeof(float),
+                               cudaMemcpyHostToDevice))
+    CHECK_CUDA(cudaMemcpy(dB, input.matB, input.B_size * sizeof(float),
+                               cudaMemcpyHostToDevice))
+    CHECK_CUDA(cudaMemcpy(dC_offsets, input.hC_offsets,
                                (input.A_num_rows + 1) * sizeof(int),
-                               cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(dC_columns, input.hC_columns, input.C_nnz * sizeof(int),
-                               cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(dC_values, input.hC_values, input.C_nnz * sizeof(float),
-                               cudaMemcpyHostToDevice));
+                               cudaMemcpyHostToDevice))
+    CHECK_CUDA(cudaMemcpy(dC_columns, input.hC_columns, input.C_nnz * sizeof(int),
+                               cudaMemcpyHostToDevice))
+    CHECK_CUDA(cudaMemcpy(dC_values, input.hC_values, input.C_nnz * sizeof(float),
+                               cudaMemcpyHostToDevice))
     //--------------------------------------------------------------------------
     // CUSPARSE APIs
-    cusparseHandle_t handle = NULL;
+    cusparseHandle_t handle = nullptr;
     cusparseDnMatDescr_t matA, matB;
     cusparseSpMatDescr_t matC;
-    void *dBuffer = NULL;
+    void *dBuffer = nullptr;
     size_t bufferSize = 0;
-    checkCudaErrors(cusparseCreate(&handle));
+    CHECK_CUSPARSE(cusparseCreate(&handle));
     // Create dense matrix A
-    checkCudaErrors(cusparseCreateDnMat(&matA, input.A_num_rows, input.A_num_cols, input.lda, dA,
-                                        CUDA_R_32F, CUSPARSE_ORDER_ROW));
+    CHECK_CUSPARSE(cusparseCreateDnMat(&matA, input.A_num_rows, input.A_num_cols, input.lda, dA,
+                                        CUDA_R_32F, CUSPARSE_ORDER_ROW))
     // Create dense matrix B
-    checkCudaErrors(cusparseCreateDnMat(&matB, input.A_num_cols, input.B_num_cols, input.ldb, dB,
-                                        CUDA_R_32F, CUSPARSE_ORDER_ROW));
+    CHECK_CUSPARSE(cusparseCreateDnMat(&matB, input.A_num_cols, input.B_num_cols, input.ldb, dB,
+                                        CUDA_R_32F, CUSPARSE_ORDER_ROW))
     // Create sparse matrix C in CSR format
-    checkCudaErrors(cusparseCreateCsr(&matC, input.A_num_rows, input.B_num_cols, input.C_nnz,
+    CHECK_CUSPARSE(cusparseCreateCsr(&matC, input.A_num_rows, input.B_num_cols, input.C_nnz,
                                       dC_offsets, dC_columns, dC_values,
                                       CUSPARSE_INDEX_32I, CUSPARSE_INDEX_32I,
-                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F));
+                                      CUSPARSE_INDEX_BASE_ZERO, CUDA_R_32F))
     // allocate an external buffer if needed
-    checkCudaErrors(cusparseSDDMM_bufferSize(
+    CHECK_CUSPARSE(cusparseSDDMM_bufferSize(
             handle,
             CUSPARSE_OPERATION_NON_TRANSPOSE,
             CUSPARSE_OPERATION_NON_TRANSPOSE,
             &input.alpha, matA, matB, &input.beta, matC, CUDA_R_32F,
-            CUSPARSE_SDDMM_ALG_DEFAULT, &bufferSize));
-    checkCudaErrors(cudaMalloc(&dBuffer, bufferSize));
+            CUSPARSE_SDDMM_ALG_DEFAULT, &bufferSize))
+    CHECK_CUDA(cudaMalloc(&dBuffer, bufferSize))
 
     // execute preprocess (optional)
-    checkCudaErrors(cusparseSDDMM_preprocess(
+    CHECK_CUSPARSE(cusparseSDDMM_preprocess(
         handle,
         CUSPARSE_OPERATION_NON_TRANSPOSE,
         CUSPARSE_OPERATION_NON_TRANSPOSE,
         &input.alpha, matA, matB, &input.beta, matC, CUDA_R_32F,
-        CUSPARSE_SDDMM_ALG_DEFAULT, dBuffer));
+        CUSPARSE_SDDMM_ALG_DEFAULT, dBuffer))
     // execute SpMM
-    checkCudaErrors(cusparseSDDMM(
+    CHECK_CUSPARSE(cusparseSDDMM(
           handle,
           CUSPARSE_OPERATION_NON_TRANSPOSE,
           CUSPARSE_OPERATION_NON_TRANSPOSE,
           &input.alpha, matA, matB, &input.beta, matC, CUDA_R_32F,
-          CUSPARSE_SDDMM_ALG_DEFAULT, dBuffer));
+          CUSPARSE_SDDMM_ALG_DEFAULT, dBuffer))
     // destroy matrix/vector descriptors
-    checkCudaErrors(cusparseDestroyDnMat(matA));
-    checkCudaErrors(cusparseDestroyDnMat(matB));
-    checkCudaErrors(cusparseDestroySpMat(matC));
-    checkCudaErrors(cusparseDestroy(handle));
+    CHECK_CUSPARSE(cusparseDestroyDnMat(matA))
+    CHECK_CUSPARSE(cusparseDestroyDnMat(matB))
+    CHECK_CUSPARSE(cusparseDestroySpMat(matC))
+    CHECK_CUSPARSE(cusparseDestroy(handle))
     //--------------------------------------------------------------------------
     // device result check
     // Copy result from device to host
-    checkCudaErrors(
+    CHECK_CUDA(
             cudaMemcpyAsync(input.hC_values, dC_values, input.C_nnz * sizeof(float),
-                            cudaMemcpyDeviceToHost, stream));
-    checkCudaErrors(cudaStreamSynchronize(stream));
+                            cudaMemcpyDeviceToHost, stream))
+    CHECK_CUDA(cudaStreamSynchronize(stream))
 
     // B rows = C rows && A || B cols = C cols
-    bool correct = validate(input.B_num_rows, input.B_num_cols, input.hC_values, input.A_num_rows);
+    bool correct = validate_sddmm(input.C_nnz, input.hC_values, input.hC_result);
     //--------------------------------------------------------------------------
     // device memory deallocation
-    checkCudaErrors(cudaFree(dBuffer));
-    checkCudaErrors(cudaFree(dA));
-    checkCudaErrors(cudaFree(dB));
-    checkCudaErrors(cudaFree(dC_offsets));
-    checkCudaErrors(cudaFree(dC_columns));
-    checkCudaErrors(cudaFree(dC_values));
+    CHECK_CUDA(cudaFree(dBuffer))
+    CHECK_CUDA(cudaFree(dA))
+    CHECK_CUDA(cudaFree(dB))
+    CHECK_CUDA(cudaFree(dC_offsets))
+    CHECK_CUDA(cudaFree(dC_columns))
+    CHECK_CUDA(cudaFree(dC_values))
     return correct;
 }
 
@@ -193,7 +212,7 @@ void _spmm(MatMul input, cudaStream_t stream) {
 bool _sddmmSpmm(MatMul input, cudaStream_t stream) {
     bool correct = _sddmm(input, stream);
     if(!correct) {
-        printf("sddmm failed");
+        printf("sddmm failed\n");
     }
     return correct;
 }
@@ -252,34 +271,34 @@ int main() {
     // Initialize timing variables
     cudaStream_t stream;
     cudaEvent_t start, stop;
-    checkCudaErrors(cudaEventCreate(&start));
-    checkCudaErrors(cudaEventCreate(&stop));
-    checkCudaErrors(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    CHECK_CUDA(cudaEventCreate(&start))
+    CHECK_CUDA(cudaEventCreate(&stop))
+    CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking))
 
     // Performs warmup operation using _sddmmSpmm CUDA kernel
     bool correct = _sddmmSpmm(test, stream);
 
     printf("done\n");
-    checkCudaErrors(cudaStreamSynchronize(stream));
-
-    // Record the start event
-    checkCudaErrors(cudaEventRecord(start, stream));
+    CHECK_CUDA(cudaStreamSynchronize(stream))
 
     // Execute the kernel
     int nIter = 300;
+
+    // Record the start event
+    CHECK_CUDA(cudaEventRecord(start, stream))
 
     for (int j = 0; j < nIter; j++) {
         _sddmmSpmm(test, stream);
     }
 
     // Record the stop event
-    checkCudaErrors(cudaEventRecord(stop, stream));
+    CHECK_CUDA(cudaEventRecord(stop, stream))
 
     // Wait for the stop event to complete
-    checkCudaErrors(cudaEventSynchronize(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop))
 
     float msecTotal = 0.0f;
-    checkCudaErrors(cudaEventElapsedTime(&msecTotal, start, stop));
+    CHECK_CUDA(cudaEventElapsedTime(&msecTotal, start, stop))
 
     calcPerf(msecTotal, nIter, test.A_num_rows, test.A_num_cols, test.B_num_rows);
 
