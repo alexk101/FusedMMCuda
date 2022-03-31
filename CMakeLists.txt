@@ -19,7 +19,6 @@ set(CMAKE_CUDA_COMPILER "${CUDAToolkit_NVCC_EXECUTABLE}")
 target_link_libraries( FusedCuda ${CUDA_cusparse_LIBRARY} )
 #message(FATAL_ERROR "Cuda Runtime exists at ${CUDA_cusparse_LIBRARY}")
 
-
 include_directories(${CUDA_TOOLKIT_INCLUDE_DIRECTORIES} common)
 target_compile_options(FusedCuda PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${CUDA_NVCC_FLAGS}>)
 
